@@ -1,0 +1,13 @@
+name = Paystation module for DrupalCommerce
+description = Paystation Three-party payment module for Drupal Commerce
+package = Commerce (contrib)
+dependencies[] = commerce_payment
+dependencies[] = rules
+core = 7.x
+
+; Information added by drupal.org packaging script on 2012-03-03
+version = "7.x-1.x"
+core = "7.x"
+project = "commerce_paystation"
+datestamp = "1330776422"
+

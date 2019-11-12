@@ -1,0 +1,624 @@
+<?php
+
+function commerce_paystation_menu()
+{
+    // Define a path to receive postback, and 
+    $items = array();
+    $items['commerce-paystation/postback'] = array(
+        'page callback' => 'commerce_paystation_postback',
+        'access arguments' => array('access content'),
+        'type' => MENU_CALLBACK
+    );
+
+    //Define a path for return URL when postback is enabled
+    $items['commerce-paystation/return'] = array(
+        'page callback' => 'commerce_paystation_return',
+        'access arguments' => array('access content'),
+        'type' => MENU_CALLBACK
+    );
+    return $items;
+}
+
+/**
+ * @file
+ * Implements paystation for use with Drupal Commerce.
+ */
+function commerce_paystation_commerce_payment_method_info()
+{
+    $payment_methods = array();
+
+    //$icons = commerce_paystation_icons();
+    $display_title = t('Credit card via Paystation Payment Gateway');
+    //unset ($icons['paystation']);
+    $display_title .= '<div class="commerce-paystation-icons">(You will be redirected to Paystation Payment Gateway to complete your transaction.)</div>';
+
+    $payment_methods['paystation'] = array(
+        'base' => 'commerce_paystation',
+        'title' => t('paystation'),
+        'short_title' => t('Paystation'),
+        'display_title' => $display_title,
+        'description' => t('paystation'),
+        'terminal' => FALSE,
+        'offsite' => TRUE,
+        'offsite_autoredirect' => TRUE,
+    );
+
+    return $payment_methods;
+}
+
+/**
+ * Payment method callback: settings form.
+ * Settings parameters
+ */
+function commerce_paystation_settings_form($settings = null)
+{
+    $form = array();
+
+    $settings = (array)$settings + array(
+            'paystation_id' => '',
+            'gateway_id' => '',
+            'test_mode' => true,
+            'fixed' => true,
+            'language' => 'en',
+            'pay_method' => 'CC',
+            'HMAC_key' => '',
+            'logging' => '',
+            'coupon' => '',
+        );
+
+    $form['paystation_id'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Paystation ID'),
+        '#description' => t('Your paystation account number.'),
+        '#default_value' => $settings['paystation_id'],
+        '#maxlength' => 6,
+        '#required' => TRUE,
+    );
+    $form['gateway_id'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Gateway ID'),
+        '#description' => t('Gateway ID'),
+        '#default_value' => $settings['gateway_id'],
+        '#maxlength' => 55,
+        '#required' => TRUE,
+    );
+    $form['HMAC_key'] = array(
+        '#type' => 'textfield',
+        '#title' => t('HMAC Key'),
+        '#description' => t('HMAC key provided by Paystation.'),
+        '#default_value' => $settings['HMAC_key'],
+        '#maxlength' => 55,
+        '#required' => TRUE,
+    );
+    $form['postback'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Enable Postback'),
+        '#description' => t('We strongly suggest checking the "Enable Postback" box, as it will allow the cart to capture payment results even
+                                    if your customers re-direct is interrupted.  However, if your development/test environment is local or on a network
+                                    that cannot receive connections from the internet, you must disable Postback. <br/><br/>
+                                Your Paystation account needs to reflect your Ubercart settings accurately, otherwise order status will not update correctly.'),
+        '#default_value' => $settings['postback'],
+    );
+    $form['test_mode'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Test mode.'),
+        '#description' => t('Enable test mode.'),
+        '#default_value' => $settings['test_mode'],
+    );
+    $form['logging'] = array(
+        '#type' => 'radios',
+        '#title' => t('Logging'),
+        '#options' => array(
+            'notification' => t('Log notifications during processing.'),
+            'full' => t('Log notifications with all data during validation and processing (used for debugging).'),
+        ),
+        '#default_value' => $settings['logging'],
+    );
+
+    return $form;
+}
+
+/**
+ * Payment method callback: adds a message and CSS to the submission form.
+ */
+function commerce_paystation_submit_form($payment_method, $pane_values, $checkout_pane, $order)
+{
+    $form['paystation_information'] = array();
+    return $form;
+}
+
+/**
+ * Payment method callback: redirect form, a wrapper around the module's general
+ *   use function for building a paystation form.
+ */
+function commerce_paystation_redirect_form($form, &$form_state, $order, $payment_method)
+{
+    // Return an error if the enabling action's settings haven't been configured.
+    if (empty($payment_method['settings']['paystation_id'])) {
+        drupal_set_message(t('The Paystation module is not configured for use. No Paystation ID has been specified.'), 'error');
+        return array();
+    }
+    if (empty($payment_method['settings']['gateway_id'])) {
+        drupal_set_message(t('The Paystation module is not configured for use. No Gateway ID has been specified.'), 'error');
+        return array();
+    }
+    if (empty($payment_method['settings']['HMAC_key'])) {
+        drupal_set_message(t('The Paystation module is not configured for use. No HMAC key has been specified.'), 'error');
+        return array();
+    }
+    return commerce_paystation_order_form($form, $form_state, $order, $payment_method['settings']);
+}
+
+
+/*
+ * This function is called when returning from paystation and postback is enabled.
+ */
+function commerce_paystation_return()
+{
+    if (isset($_GET['em'])) {
+        $xpl = explode(':', $_GET['merchant_ref']);
+        $orderid = $xpl[1];
+        $order = commerce_order_load_by_number($orderid);
+        $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+        commerce_paystation_return_url($order, $payment_method);
+    }
+}
+
+/**
+ * Payment method callback: all returns from paystation are returned here.
+ * http://carts-d7.paystation.facenet/drupal-7.27_install2/checkout/13/payment/return/opZ8vSfxjQkfttl1YFr6_ygKqdUTqLcwxTQ5zXRxs1k
+ * This function is called on returning from Paystation when postback is disabled. Returning to the
+ * same url when postback disabled results in this function not being called.
+ */
+function commerce_paystation_redirect_form_validate($order, $payment_method)
+{
+    if (isset($_GET['em'])) {
+        commerce_paystation_return_url($order, $payment_method);
+    }
+}
+
+//This function is called to process Postback response
+function commerce_paystation_postback($param)
+{
+    // Postback url: {host}/{drupal}/commerce-paystation/postback
+
+    $xml = file_get_contents('php://input');
+    $xml = simplexml_load_string($xml);
+
+    if (!empty($xml)) {
+        //echo ('<hr>!empty(xml) <br><br>');
+        $errorCode = (int)$xml->ec;
+        $errorMessage = $xml->em;
+        $transactionId = $xml->ti;
+        $cardType = $xml->ct;
+        $merchantReference = $xml->merchant_ref;
+        $testMode = $xml->tm;
+        $merchantSession = $xml->MerchantSession;
+        $usedAcquirerMerchantId = $xml->UsedAcquirerMerchantID;
+        $amount = $xml->PurchaseAmount; // Note this is in cents
+        $transactionTime = $xml->TransactionTime;
+        $requestIp = $xml->RequestIP;
+
+
+        $message = "Error Code: " . $errorCode . "<br/>";
+        $message .= "Error Message: " . $errorMessage . "<br/>";
+        $message .= "Transaction ID: " . $transactionId . "<br/>";
+        $message .= "Card Type: " . $cardType . "<br/>";
+        $message .= "Merchant Reference: " . $merchantReference . "<br/>";
+        $message .= "Test Mode: " . $testMode . "<br/>";
+        $message .= "Merchant Session: " . $merchantSession . "<br/>";
+        $message .= "Merchant ID: " . $usedAcquirerMerchantId . "<br/>";
+        $message .= "Amount: " . $amount . " (cents)<br/>";
+        $message .= "Transaction Time: " . $transactionTime . "<br/>";
+        $message .= "IP: " . $requestIp . "<br/>";
+
+        $merchant_ref = $merchantReference;
+        $xpl = explode(':', $merchant_ref);
+        $orderid = $xpl[1];
+        echo "ec: " . $errorCode;
+
+        $order = commerce_order_load_by_number($orderid);
+
+        $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+        $settings = $payment_method['settings'];
+        $test = $settings['test_mode'];
+        if ($xpl[2] == 'test-mode' && $test != 1) return false;
+
+        if (!empty($payment_method['settings']['logging']) &&
+            $payment_method['settings']['logging'] == 'full') {
+            watchdog('commerce_paystation', 'Customer returned from Paystation Payment Gateway with the following query string:<pre>' . check_plain(print_r($_GET, TRUE)) . '</pre>', array(), WATCHDOG_NOTICE);
+        }
+
+        global $user;
+        $order_number = $order->order_number;
+        $success = ($errorCode == '0');
+
+        if ($success == false) {
+            commerce_order_status_update($order, 'checkout_review');
+            commerce_order_save($order);
+            //COMMERCE_PAYMENT_STATUS_FAILURE
+            $transaction = commerce_payment_transaction_new('Paystation', $_GET['ti']);
+            $transaction->instance_id = $payment_method['instance_id'];
+            $transaction->amount = commerce_currency_decimal_to_amount($_GET['am'], commerce_default_currency());
+            $transaction->currency_code = commerce_default_currency();
+            $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+            $transaction->message = t('The payment failed with the following error message from the payment gateway: ' . $_GET['em'] . ' .');
+            drupal_set_message($transaction->message, 'error');
+            commerce_payment_transaction_save($transaction);
+            return FALSE;
+        } else {
+            echo "payment success";
+            commerce_order_status_update($order, 'processing');
+            commerce_order_save($order);
+            // Save the transaction information.
+            $transaction = commerce_payment_transaction_new('Paystation', $_GET['ti']);
+            $transaction->instance_id = $payment_method['instance_id'];
+            $transaction->amount = commerce_currency_decimal_to_amount($_GET['am'], commerce_default_currency());
+            $transaction->currency_code = commerce_default_currency();
+            $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+            $transaction->message = t('The payment has completed.');
+            drupal_set_message("Paystation payment successful.", 'status');
+            commerce_payment_transaction_save($transaction);
+        }
+    }
+}
+
+
+//This function processes the query string when returing from paystation. Calls the Quicklookup
+// function if Postback is disabled. If postback is enabled then the return URL is different,
+// so redirects to the appropriate page after generating a drupal message.
+function commerce_paystation_return_url($order, $payment_method)
+{
+    // return url: {host}/{drupal}/checkout/{order}/payment/return/
+    $settings = $payment_method['settings'];
+    $postback = $settings['postback'];
+    $test_mode = $settings['test_mode'];
+    $mr = $_GET['merchant_ref'];
+    $xpl = explode(':', $mr);
+    if ($xpl[2] == 'test-mode' && $test_mode != 1) return false;
+
+    $success = true;
+    if (isset($_GET['em'])) {
+        $error_message = $_GET['em'];
+        if ($_GET['ec'] === '0') {
+            if (!$postback) {
+                $responseCode = _transactionVerification($payment_method['settings']['paystation_id'], $_GET['ti'], $_GET['ms']);
+
+                if ((int)$responseCode == 0)
+                    $success = true;
+                else {
+                    $success = false;
+                    $error_message = "Response code does not match";
+                }
+            } else
+                $success = true;
+        } else
+            $success = false;
+    } else
+        $success = false;
+
+    if (!empty($payment_method['settings']['logging']) &&
+        $payment_method['settings']['logging'] == 'full') {
+        watchdog('commerce_paystation', 'Customer returned from Paystation Payment Gateway with the following query string:<pre>' . check_plain(print_r($_GET, TRUE)) . '</pre>', array(), WATCHDOG_NOTICE);
+    }
+
+    global $user;
+    $order_number = $order->order_number;
+
+    if ($success == false) {
+        $message = t('The payment failed with the following error message from the payment gateway: ' . $_GET['em'] . '.');
+
+        if (!$postback) {
+            commerce_order_status_update($order, 'checkout_review');
+            commerce_order_save($order);
+            //COMMERCE_PAYMENT_STATUS_FAILURE
+            $transaction = commerce_payment_transaction_new('Paystation', $_GET['ti']);
+            $transaction->instance_id = $payment_method['instance_id'];
+            $transaction->amount = commerce_currency_decimal_to_amount($_GET['am'], commerce_default_currency());
+            $transaction->currency_code = commerce_default_currency();
+            $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+            $transaction->message = $message;
+            commerce_payment_transaction_save($transaction);
+        }
+        drupal_set_message($message, 'error');
+        if ($postback != 1) return FALSE;
+    } else {
+        if (!$postback) {
+            $settings = $payment_method['settings'];
+            commerce_order_status_update($order, 'processing');
+            commerce_order_save($order);
+            // Save the transaction information.
+            $transaction = commerce_payment_transaction_new('Paystation', $_GET['ti']);
+            $transaction->instance_id = $payment_method['instance_id'];
+            $transaction->amount = commerce_currency_decimal_to_amount($_GET['am'], commerce_default_currency());
+            $transaction->currency_code = commerce_default_currency();
+            $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+            $transaction->message = t('The payment has completed.');
+            commerce_payment_transaction_save($transaction);
+        }
+        drupal_set_message("Paystation payment successful.", 'status');
+    }
+
+    if ($postback && !$success) drupal_goto(url("checkout/$order_number/review", array('absolute' => true)));
+    if ($postback && $success) drupal_goto(url("checkout/$order_number/complete", array('absolute' => true)));
+}
+
+/**
+ * Helper function to get some country code; requires Apache's mod_geoip to
+ * be loaded and enabled.
+ */
+function commerce_paystation_guess_country_code()
+{
+    $country_code = isset($_REQUEST['country_code']) ? $_REQUEST['country_code'] : apache_note('GEOIP_COUNTRY_CODE');
+    return $country_code;
+}
+
+/**
+ * Keyed array of paystation parameters
+ */
+function commerce_paystation_purchase_parameters($order, $settings)
+{
+    return null;
+}
+
+/**
+ * Builds a paystation form from an order object.
+ *
+ * @param $order
+ *   The fully loaded order being paid for.
+ * @param $settings
+ *   An array of settings used to build out the form, including:
+ *   - account: the paystation account the payment submits to
+ *   - x_receipt_link_url: the URL paystation should send the user to on successful payment
+ *   - language: the language code to use on the payment form
+ *
+ * @return
+ *   A renderable form array.
+ */
+function commerce_paystation_order_form($form, &$form_state, $order, $settings)
+{
+    $data = commerce_paystation_purchase_parameters($order, $settings);
+
+    $form['#action'] = commerce_paystation_server_url($settings, $order);
+
+    $form['submit'] = array(
+        '#type' => 'submit',
+        '#value' => t('Proceed to Paystation Payment Gateway'),
+    );
+
+    return $form;
+}
+
+/**
+ * Redirects to checkouts using GET instead of form POST
+ */
+function commerce_paystation_redirect_checkout($order)
+{
+    // Generate a key to use in the return URL from the redirected service.
+    $order->data['payment_redirect_key'] = drupal_hash_base64(time());
+    // And force paystation payment mechanism, must supply a payment instance id
+    reset($order->payment_methods);
+    $order->data['payment_method'] = key($order->payment_methods);
+    $order->data['offsite'] = true;
+    commerce_order_save($order);
+
+    // And make proper URL
+    $settings = reset($order->payment_methods);
+    $settings = $settings['settings'];
+    $data = commerce_paystation_purchase_parameters($order, $settings);
+
+    drupal_goto(commerce_paystation_server_url($settings, $data), array('query' => $data));
+}
+
+/**
+ * Assume the shipping rate is available in $_REQUEST, and add that
+ * now. Useful when product + shipping rates are on one page.
+ */
+function commerce_paystation_add_shipping($order)
+{
+    if (isset($_REQUEST['shipping_service'])) {
+        $service = $_REQUEST['shipping_service'];
+        $shipping_service = commerce_shipping_service_load($service);
+        $callback = commerce_shipping_service_callback($shipping_service, 'rate');
+        $price = $callback($shipping_service, $order);
+        $line_item = commerce_shipping_service_rate_calculate($service, $price, $order->order_id);
+        commerce_shipping_add_shipping_line_item($line_item, $order);
+    }
+}
+
+/**
+ * Returns an array of paystation payment method icon img elements.
+ *
+ * @return
+ *   The array of themed payment method icons keyed by name: visa, mastercard,
+ *   amex, discover, paypal, paystation
+ */
+function commerce_paystation_icons()
+{
+    return [];
+}
+
+/**
+ * Initialises Paystation and returns the URL to redirect to.
+ * The return URL is dynamic, since the URL is different if
+ * postback is enabled or not, and if postback is disabled then the return URL
+ * contains the order number.
+ *
+ * @return
+ *   The URL to use to submit requests to paystation.
+ */
+function commerce_paystation_server_url($settings, $data)
+{
+    $total = $data->commerce_order_total['und'][0]['amount'];
+
+    $PaystationID = trim($settings['paystation_id']);
+    $GatewayID = trim($settings['gateway_id']);
+    $test = $settings['test_mode'];
+
+    $postback = $settings['postback'];
+
+    if ($test == 1)
+        $test_string = '&pstn_tm=t';
+    else
+        $test_string = '';
+
+    $redirect_key = $data->data['payment_redirect_key'];
+
+    $pstn_pi = $PaystationID;
+    $pstn_gi = $GatewayID;
+    $pstn_am = round($total);
+    $pstn_mr = 'OrderNumber:' . $data->order_number . ':';
+    if ($test == 1)
+        $pstn_mr .= 'test-mode';
+    $pstn_ms = $data->order_number . '-' . time() . '-' . _makePaystationSessionID(8, 8);
+    if ($postback != 1) $pstn_du = urlencode(url('checkout/' . $data->order_number . '/payment/return/' . $redirect_key, array('absolute' => TRUE)));
+    else $pstn_du = urlencode(url('commerce-paystation/return', array('absolute' => TRUE)));
+
+    $paystationParams = "paystation=_empty&pstn_nr=t&pstn_du=$pstn_du&pstn_pi=$pstn_pi&pstn_gi=$pstn_gi&pstn_ms=$pstn_ms&pstn_am=$pstn_am&pstn_mr=$pstn_mr$test_string";
+    $authenticationKey = $settings['HMAC_key'];
+    $hmacWebserviceName = 'paystation';
+    $pstn_HMACTimestamp = time();
+    $hmacBody = pack('a*', $pstn_HMACTimestamp) . pack('a*', $hmacWebserviceName) . pack('a*', $paystationParams);
+
+    $hmacHash = hash_hmac('sha512', $hmacBody, $authenticationKey);
+    $hmacGetParams = '?pstn_HMACTimestamp=' . $pstn_HMACTimestamp . '&pstn_HMAC=' . $hmacHash;
+
+    $paystationURL = 'https://www.paystation.co.nz/direct/paystation.dll' . $hmacGetParams;
+
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $paystationParams);
+    curl_setopt($ch, CURLOPT_URL, $paystationURL);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+    if (isset($_SERVER['HTTP_USER_AGENT'])) {
+        curl_setopt($ch, CURLOPT_USERAGENT, $_SERVER['HTTP_USER_AGENT']);
+    }
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    $result = curl_exec($ch);
+    curl_close($ch);
+    $p = xml_parser_create();
+    xml_parse_into_struct($p, $result, $vals, $tags);
+    xml_parser_free($p);
+    for ($j = 0; $j < count($vals); $j++) {
+        if (!strcmp($vals[$j]["tag"], "TI") && isset($vals[$j]["value"])) {
+            $returnTI = $vals[$j]["value"];
+        }
+        if (!strcmp($vals[$j]["tag"], "EC") && isset($vals[$j]["value"])) {
+            $errorCode = $vals[$j]["value"];
+        }
+        if (!strcmp($vals[$j]["tag"], "DIGITALORDER") && isset($vals[$j]["value"])) {
+            $digitalOrder = $vals[$j]["value"];
+        }
+    }
+    $hresult = htmlentities($result);
+
+    if (isset($digitalOrder)) {
+        return $digitalOrder;
+    } else {
+        exit("digitalOrder not set");
+    }
+}
+
+/**
+ * Returns an array of all possible language codes.
+ */
+function commerce_paystation_languages()
+{
+    return array('en' => 'English'); //, 'zh' => 'Chinese', 'da' => 'Danish', 'nl' => 'Dujtch', 'fr' => 'French', 'gr' => 'German', 'el' => 'Greek', 'it' => 'Italian', 'jp' => 'Japanese', 'no' => 'Norwegian', 'pt' => 'Portugese', 'sl' => 'Slovenian', 'es_ib' => 'Spanish (es_ib)', 'es_la' => 'Spanish (es_la)', 'sv' => 'Swedish');
+}
+
+/**
+ * Returns an array of all possible currency codes.
+ */
+function commerce_paystation_currencies()
+{
+    return drupal_map_assoc(array('NZD'));
+}
+
+function _quickLookup($pi, $type, $value)
+{
+    $url = "https://payments.paystation.co.nz/lookup/"; //
+    $params = "&pi=$pi&$type=$value";
+
+    $authenticationKey = variable_get('HMAC_key', '');
+    $hmacWebserviceName = 'paystation';
+    $pstn_HMACTimestamp = time();
+
+    $hmacBody = pack('a*', $pstn_HMACTimestamp) . pack('a*', $hmacWebserviceName) . pack('a*', $params);
+    $hmacHash = hash_hmac('sha512', $hmacBody, $authenticationKey);
+    $hmacGetParams = '?pstn_HMACTimestamp=' . $pstn_HMACTimestamp . '&pstn_HMAC=' . $hmacHash;
+
+    $url .= $hmacGetParams;
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $params);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+    if (isset($_SERVER['HTTP_USER_AGENT'])) {
+        curl_setopt($ch, CURLOPT_USERAGENT, $_SERVER['HTTP_USER_AGENT']);
+    }
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    $result = curl_exec($ch);
+    curl_close($ch);
+    return $result;
+}
+
+function _transactionVerification($paystationID, $transactionID, $merchantSession)
+{
+
+    $transactionVerified = '';
+    $lookupXML = _quickLookup($paystationID, 'ms', $merchantSession);
+
+    $p = xml_parser_create();
+    xml_parse_into_struct($p, $lookupXML, $vals, $tags);
+    xml_parser_free($p);
+    foreach ($tags as $key => $val) {
+        if ($key == "PAYSTATIONERRORCODE") {
+            for ($i = 0; $i < count($val); $i++) {
+                $responseCode = _parseCode($vals);
+                $transactionVerified = $responseCode;
+            }
+        } else {
+            continue;
+        }
+    }
+
+    return $transactionVerified;
+}
+
+function _parseCode($mvalues)
+{
+    $result = '';
+    for ($i = 0; $i < count($mvalues); $i++) {
+        if (!strcmp($mvalues[$i]["tag"], "QSIRESPONSECODE") && isset($mvalues[$i]["value"])) {
+            $result = $mvalues[$i]["value"];
+        }
+    }
+    return $result;
+}
+
+function _makePaystationSessionID($min = 8, $max = 8)
+{
+    // seed the random number generator - straight from PHP manual
+    $seed = (double)microtime() * getrandmax();
+    srand($seed);
+
+    $pass = '';
+    // make a string of $max characters with ASCII values of 40-122
+    $p = 0;
+    while ($p < $max):
+        $r = chr(123 - (rand() % 75));
+
+        // get rid of all non-alphanumeric characters
+        if (!($r >= 'a' && $r <= 'z') && !($r >= 'A' && $r <= 'Z') && !($r >= '1' && $r <= '9'))
+            continue;
+        $pass .= $r;
+
+        $p++;
+    endwhile;
+    // if string is too short, remake it
+    if (strlen($pass) < $min)
+        $pass = _makePaystationSessionID($min, $max);
+
+    return $pass;
+}
